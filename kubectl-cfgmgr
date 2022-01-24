@@ -1,0 +1,31 @@
+#!/bin/bash
+if [[ $# -ne 2 ]]
+then 
+    echo "Usage:"
+    echo "  kubectl cfgmgr merge <KUBECONFIG_FILE>"
+    echo "  kubectl cfgmgr delete <KUBECONFIG_FILE>"
+    exit 1
+fi
+
+if [[ ! -f "$2" ]]
+then 
+    echo "$2 does not exist."
+    exit 1
+fi
+
+if [[ "$1" == "merge" ]]
+then
+    cp ~/.kube/config ~/.kube/config_cfgmgr.bak
+    grep current-context ~/.kube/config > /tmp/kubeconfig_current-context_${2##*/}
+    KUBECONFIG=~/.kube/config:$2 kubectl config view --flatten > /tmp/kubeconfig
+    sed -i "s/current-context:.*/$(grep current-context $2)/" /tmp/kubeconfig
+    mv /tmp/kubeconfig ~/.kube/config
+fi
+
+if [[ "$1" == "delete" ]]
+then
+    diff --unchanged-line-format= --old-line-format='%L' --new-line-format= ~/.kube/config <(grep -v '^[a-z]' $2) > /tmp/kubeconfig
+    sed -i "s/current-context:.*/$(cat /tmp/kubeconfig_current-context_${2##*/})/" /tmp/kubeconfig
+    mv /tmp/kubeconfig ~/.kube/config
+    rm /tmp/kubeconfig_current-context_${2##*/}
+fi
