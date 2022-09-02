@@ -11,3 +11,7 @@ entry:
 log:
 - kubectl logs with fzf
 - `kubectl log <fzf query term> [-f] [-p] [-n namespace] [-c container] ...`
+
+desc:
+- kubectl describe with fzf
+- `kubectl desc [resource] [fzf query term]`
