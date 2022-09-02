@@ -1,6 +1,6 @@
 #!/bin/bash
-{ 
-    kubectl exec -it $(kubectl get po -A | grep Running | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2} -- bash 
-} || {
-    kubectl exec -it $(kubectl get po -A | grep Running | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2} -- sh
-}
+CMD="kubectl exec -it $(kubectl get po -A | grep Running | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2}"
+$CMD -- bash
+if [ $? -eq 126 ]; then
+    $CMD -- sh
+fi
