@@ -1,6 +1,10 @@
 #!/bin/bash
 CMD="kubectl exec -it $(kubectl get po -A | grep Running | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2}"
-$CMD -- bash
-if [ $? -eq 126 ]; then
-    $CMD -- sh
+if [[ "${@:2}" == *"--"* ]]; then
+    $CMD
+else
+    $CMD -- bash
+    if [ $? -eq 126 ]; then
+        $CMD -- sh
+    fi
 fi
