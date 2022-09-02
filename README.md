@@ -15,3 +15,7 @@ log:
 desc:
 - kubectl describe with fzf
 - `kubectl desc [resource] [fzf query term]`
+
+g: 
+- kubectl get with fzf
+- `kubectl desc [resource] [fzf query term] [options]`

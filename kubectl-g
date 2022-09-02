@@ -1,0 +1,18 @@
+#!/bin/bash
+if [ "$#" -eq 0 ]; then
+    API_RESOURCE=$(kubectl api-resources --no-headers | fzf | awk '{print $1}')
+    if [ "$API_RESOURCE" == "" ]; then 
+        exit 1
+    fi
+else
+    API_RESOURCE=$1
+fi 
+
+ARG=$(kubectl get $API_RESOURCE -A --no-headers | fzf -1 -n2 -q "$2" | awk '{print "-n" $1, $2}')
+
+if [ "$ARG" == "" ]; then 
+    exit 1
+else
+    kubectl get $API_RESOURCE $ARG ${@:3}
+fi
+
