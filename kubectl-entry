@@ -1,0 +1,6 @@
+#!/bin/bash
+{ 
+    kubectl exec -it $(kubectl get po -A | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2} -- bash 
+} || {
+    kubectl exec -it $(kubectl get po -A | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2} -- sh
+}
