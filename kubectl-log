@@ -1,0 +1,2 @@
+#!/bin/bash
+kubectl logs $(kubectl get po -A | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2}
