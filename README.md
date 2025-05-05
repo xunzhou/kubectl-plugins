@@ -19,3 +19,7 @@ desc:
 g: 
 - kubectl get with fzf
 - `kubectl desc [resource] [fzf query term] [options]`
+
+diff-rs:
+- kubectl diff-rs <replicaset>
+- kubectl diff-rs <replicaset> LAST LAST-3

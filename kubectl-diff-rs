@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Validate input
+if [[ $# -lt 1 ]]; then
+  echo "Usage: kubectl diff-replicasets <deployment> [REV1] [REV2]"
+  echo "Example: kubectl diff-replicasets my-deployment LAST LAST-2"
+  exit 1
+fi
+
+DEPLOYMENT="$1"
+REV1="${2:-LAST}"
+REV2="${3:-LAST-1}"
+
+# Namespace handling
+NS_OPT=()
+if [[ -n "${NAMESPACE:-}" ]]; then
+  NS_OPT=(-n "$NAMESPACE")
+fi
+
+# Get all ReplicaSets sorted by creationTimestamp
+REPLICASETS=$(kubectl get rs "${NS_OPT[@]}" -o json |
+  jq -r --arg DEP "$DEPLOYMENT" '
+        .items[]
+        | select(.metadata.ownerReferences[]?.name == $DEP)
+        | "\(.metadata.creationTimestamp) \(.metadata.name)"
+    ' | sort)
+
+RS_NAMES=($(echo "$REPLICASETS" | awk '{print $2}'))
+
+# Map LAST, LAST-1, etc. to actual names
+resolve_rev() {
+  local ref="$1"
+  local count="${#RS_NAMES[@]}"
+  if [[ "$ref" =~ ^LAST(-[0-9]+)?$ ]]; then
+    local offset="${ref#LAST}"
+    offset="${offset:1}" # strip leading "-"
+    offset="${offset:-0}"
+    local index=$((count - 1 - offset))
+    if ((index < 0 || index >= count)); then
+      echo "Error: Revision '$ref' is out of range (only $count revisions available)"
+      exit 1
+    fi
+    echo "${RS_NAMES[$index]}"
+  else
+    echo "$ref"
+  fi
+}
+
+RS1=$(resolve_rev "$REV1")
+RS2=$(resolve_rev "$REV2")
+
+echo "Diffing ReplicaSets: $RS1 vs $RS2"
+kubectl get rs "$RS1" "$RS2" "${NS_OPT[@]}" \
+  -o custom-columns="NAME:.metadata.name,DESIRED:.spec.replicas,CURRENT:.status.replicas,READY:.status.readyReplicas,CREATED:.metadata.creationTimestamp" \
+  --sort-by=.metadata.creationTimestamp
+
+# Show the diff
+diff -u \
+  <(kubectl get rs "$RS2" "${NS_OPT[@]}" -o yaml | kubectl neat) \
+  <(kubectl get rs "$RS1" "${NS_OPT[@]}" -o yaml | kubectl neat)
