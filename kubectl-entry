@@ -3,8 +3,5 @@ CMD="kubectl exec -it $(kubectl get po -A | grep Running | fzf -1 -n2 -q "$1" | 
 if [[ "${@:2}" == *"--"* ]]; then
     $CMD
 else
-    $CMD -- bash
-    if [ $? -eq 126 ]; then
-        $CMD -- sh
-    fi
+    $CMD -- sh -c 'clear; (bash || ash || sh)'
 fi
