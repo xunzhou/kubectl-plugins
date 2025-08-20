@@ -23,3 +23,10 @@ g:
 diff-rs:
 - kubectl diff-rs <replicaset>
 - kubectl diff-rs <replicaset> LAST LAST-3
+
+recreate:  
+kubectl recreate -f <file>
+
+cordonx:
+- kubectl cordonx <node1> [node2 ...]
+- kubectl cordonx --undo

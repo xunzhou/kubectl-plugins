@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Cordons all nodes except those passed as arguments, or uncordons disabled nodes with --undo
+
+undo=0
+nodes=()
+
+# Parse arguments
+for arg in "$@"; do
+  case "$arg" in
+  -u | --undo)
+    undo=1
+    ;;
+  *)
+    nodes+=("$arg")
+    ;;
+  esac
+done
+
+if [ $undo -eq 0 ] && [ ${#nodes[@]} -eq 0 ]; then
+  echo "Usage: kubectl cordonx <node1> [node2 ...]"
+  echo "       kubectl cordonx --undo"
+  exit 1
+fi
+
+if [ $undo -eq 1 ]; then
+  # Uncordon nodes that are currently cordoned (SchedulingDisabled)
+  kubectl get nodes --no-headers | awk '$2=="Ready,SchedulingDisabled"{print $1}' | while read -r node; do
+    kubectl uncordon "$node"
+  done
+else
+  # Build exclusion regex from arguments
+  exclude_regex=$(
+    IFS='|'
+    echo "${nodes[*]}"
+  )
+
+  # Cordons nodes not in the exclude list
+  kubectl get nodes --no-headers | grep -vE "$exclude_regex" | awk '{print $1}' | while read -r node; do
+    kubectl cordon "$node"
+  done
+fi
