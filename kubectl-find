@@ -1,0 +1,474 @@
+#!/bin/bash
+
+set -u
+set -o pipefail
+
+# Execution mode flags
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+usage() {
+        cat <<'USAGE'
+Usage: kubectl find <resource> <pattern1> [pattern2] [...]
+
+Browse or search Kubernetes resources with optional interactive fzf support.
+
+Options:
+    -h, --help        Show this help message
+    -i, --interactive Use fzf for selection (if available)
+    -s, --sort        Sort by creation timestamp (oldest first)
+
+All other flags are forwarded to 'kubectl get'.
+USAGE
+        exit 1
+}
+
+# Check if fzf is available
+has_fzf() { command -v fzf >/dev/null 2>&1; }
+
+# Parse command line arguments
+parse_args() {
+    INTERACTIVE=false
+    RESOURCE=""
+    PATTERNS=()
+    KUBECTL_FLAGS=()
+    NAMESPACE_SET=false
+    OUTPUT_FORMAT=""
+    OUTPUT_FLAG=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                ;;
+            -i|--interactive)
+                INTERACTIVE=true
+                shift
+                ;;
+            -s|--sort)
+                # Sort by age ascending (oldest first)
+                KUBECTL_FLAGS+=("--sort-by=.metadata.creationTimestamp")
+                shift
+                ;;
+            
+            -n)
+                # Handle -n namespace (with space)
+                if [[ $# -gt 1 ]]; then
+                    KUBECTL_FLAGS+=("$1" "$2")
+                    NAMESPACE_SET=true
+                    shift 2
+                else
+                    echo -e "${RED}Error: Flag $1 requires an argument${NC}" >&2
+                    exit 1
+                fi
+                ;;
+            -n*)
+                local namespace="${1#-n}"
+                if [[ -n "$namespace" ]]; then
+                    KUBECTL_FLAGS+=("-n" "$namespace")
+                    NAMESPACE_SET=true
+                    shift
+                else
+                    if [[ $# -gt 1 ]]; then
+                        KUBECTL_FLAGS+=("$1" "$2")
+                        NAMESPACE_SET=true
+                        shift 2
+                    else
+                        echo -e "${RED}Error: Flag $1 requires an argument${NC}" >&2
+                        exit 1
+                    fi
+                fi
+                ;;
+            --namespace)
+                # Handle --namespace namespace
+                if [[ $# -gt 1 ]]; then
+                    KUBECTL_FLAGS+=("$1" "$2")
+                    NAMESPACE_SET=true
+                    shift 2
+                else
+                    echo -e "${RED}Error: Flag $1 requires an argument${NC}" >&2
+                    exit 1
+                fi
+                ;;
+            -A|--all-namespaces)
+                # Pass to kubectl and track
+                KUBECTL_FLAGS+=("$1")
+                NAMESPACE_SET=true
+                shift
+                ;;
+            -o)
+                if [[ $# -gt 1 ]]; then
+                    OUTPUT_FORMAT="$2"
+                    OUTPUT_FLAG="$1"
+                    KUBECTL_FLAGS+=("$1" "$2")
+                    shift 2
+                else
+                    echo -e "${RED}Error: Flag $1 requires an argument${NC}" >&2
+                    exit 1
+                fi
+                ;;
+            -o*)
+                OUTPUT_FORMAT="${1#-o}"
+                OUTPUT_FLAG="-o"
+                KUBECTL_FLAGS+=("-o" "$OUTPUT_FORMAT")
+                shift
+                ;;
+            --output)
+                # Handle --output format
+                if [[ $# -gt 1 ]]; then
+                    OUTPUT_FORMAT="$2"
+                    OUTPUT_FLAG="$1"
+                    KUBECTL_FLAGS+=("$1" "$2")
+                    shift 2
+                else
+                    echo -e "${RED}Error: Flag $1 requires an argument${NC}" >&2
+                    exit 1
+                fi
+                ;;
+            -*)
+                # Check if this flag takes an argument
+                case $1 in
+                    --sort-by|-l|--selector|--field-selector|--context|--cluster|--user|--kubeconfig|--cache-dir|--certificate-authority|--client-certificate|--client-key|--token|--as|--as-group|--request-timeout|--server)
+                        if [[ $# -gt 1 ]]; then
+                            KUBECTL_FLAGS+=("$1" "$2")
+                            shift 2
+                        else
+                            echo -e "${RED}Error: Flag $1 requires an argument${NC}" >&2
+                            exit 1
+                        fi
+                        ;;
+                    *)
+                        KUBECTL_FLAGS+=("$1")
+                        shift
+                        ;;
+                esac
+                ;;
+            *)
+                if [[ -z "$RESOURCE" ]]; then
+                    RESOURCE="$1"
+                else
+                    PATTERNS+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate arguments
+    if [[ -z "$RESOURCE" ]]; then
+        echo -e "${RED}Error: Resource type is required${NC}" >&2
+        usage
+    fi
+    
+    if [[ "$NAMESPACE_SET" == false ]]; then
+        KUBECTL_FLAGS+=("--all-namespaces")
+    fi
+    
+    # Auto-enable interactive mode if no patterns provided
+    if [[ ${#PATTERNS[@]} -eq 0 ]]; then
+        INTERACTIVE=true
+    fi
+}
+
+# Helper: join command array into a safely quoted shell string (uses printf %q)
+join_command_string() {
+    local out=""
+    local arg
+    for arg in "$@"; do
+        # printf %q produces a shell-escaped representation
+        local q
+        q=$(printf '%q' "$arg")
+        out="$out $q"
+    done
+    # trim leading space
+    out="${out# }"
+    echo "$out"
+}
+
+# Build grep pattern from patterns array
+build_grep_pattern() {
+    local pattern=""
+    local first=true
+    for p in "${PATTERNS[@]}"; do
+        local escaped_pattern
+        escaped_pattern=$(echo "$p" | sed 's/[[\.*^$()+{}|?]/\\&/g')
+        if $first; then
+            pattern="\\b${escaped_pattern}"
+            first=false
+        else
+            pattern="${pattern}|\\b${escaped_pattern}"
+        fi
+    done
+    echo "$pattern"
+}
+
+# Get kubectl command for listing resources (without output format for interactive browsing)
+get_kubectl_list_cmd() {
+    local resource="$1"
+    local flags=()
+    for ((i=0; i<${#KUBECTL_FLAGS[@]}; i++)); do
+        local flag="${KUBECTL_FLAGS[i]}"
+        case "$flag" in
+            -o|--output)
+                ((i++))
+                ;;
+            *) flags+=("$flag") ;;
+        esac
+    done
+    if [[ -z "$OUTPUT_FORMAT" ]]; then
+        case "$resource" in
+            po|pods|svc|services|ep|endpoints|no|nodes)
+                flags+=("-o" "wide") ;;
+        esac
+    fi
+    local cmd=(kubectl get "$resource")
+    if [[ ${#flags[@]} -gt 0 ]]; then cmd+=("${flags[@]}"); fi
+    echo "${cmd[@]}"
+}
+
+# Return a safely shell-escaped command string for listing (for fzf reload)
+get_kubectl_list_cmd_string() {
+    local resource="$1"
+    local words
+    words=$(get_kubectl_list_cmd "$resource")
+    local out=""
+    local w
+    for w in $words; do out="$out $(printf '%q' "$w")"; done
+    out="${out# }"
+    echo "$out"
+}
+
+# Get kubectl command based on resource type and options (includes output format)
+get_kubectl_cmd() {
+    local resource="$1"
+    local cmd=(kubectl get "$resource")
+    if [[ ${#KUBECTL_FLAGS[@]} -gt 0 ]]; then cmd+=("${KUBECTL_FLAGS[@]}"); fi
+    if [[ -z "$OUTPUT_FORMAT" ]]; then
+        case "$resource" in
+            po|pods|svc|services|ep|endpoints|no|nodes)
+                cmd+=("-o" "wide") ;;
+        esac
+    fi
+    echo "${cmd[@]}"
+}
+
+# Extract resource name from kubectl output line
+extract_resource_name() {
+    local line="$1"
+    if [[ " ${KUBECTL_FLAGS[*]} " =~ " --all-namespaces " ]] || [[ " ${KUBECTL_FLAGS[*]} " =~ " -A " ]]; then
+        echo "$line" | awk '{print $1 "/" $2}'
+    else
+        echo "$line" | awk '{print $1}'
+    fi
+}
+
+# Build kubectl command for selected resources
+build_kubectl_command_for_selection() {
+    local selection="$1"
+    # Return a list of commands (one per namespace group) as separate lines.
+    # Each resulting command will be a safely-escaped string for printing, but
+    # we will also construct arrays for execution.
+    
+    # Add namespace flags if they were specified
+    local flags=()
+    for ((i=0; i<${#KUBECTL_FLAGS[@]}; i++)); do
+        local flag="${KUBECTL_FLAGS[i]}"
+        case "$flag" in
+            -n|--namespace|-A|--all-namespaces)
+                flags+=("$flag")
+                if [[ "$flag" == "-n" ]] || [[ "$flag" == "--namespace" ]]; then
+                    ((i++)); flags+=("${KUBECTL_FLAGS[i]}")
+                fi
+                ;;
+            --sort-by|-l|--selector|--field-selector|--context|--cluster|--user|--kubeconfig|--cache-dir|--certificate-authority|--client-certificate|--client-key|--token|--as|--as-group|--request-timeout|--server)
+                flags+=("$flag"); ((i++)); flags+=("${KUBECTL_FLAGS[i]}") ;;
+            -o|--output|--show-labels|--show-kind|--no-headers)
+                flags+=("$flag")
+                if [[ "$flag" == "-o" ]] || [[ "$flag" == "--output" ]]; then
+                    ((i++))
+                    flags+=("${KUBECTL_FLAGS[i]}")
+                fi
+                ;;
+        esac
+    done
+    
+    # flags array is already constructed above
+    
+    # Parse resource names from selection
+    local resource_names=()
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local name
+            name=$(extract_resource_name "$line")
+            resource_names+=("$name")
+        fi
+    done <<< "$selection"
+    
+    # Determine if selection items are NAMESPACE/NAME
+    local any_ns_form=false
+    for n in "${resource_names[@]}"; do
+        if [[ "$n" == *"/"* ]]; then
+            any_ns_form=true
+            break
+        fi
+    done
+
+    local out_lines=()
+    if $any_ns_form; then
+        # Filter out --all-namespaces/-A from flags for per-namespace calls
+        local per_flags=()
+        for f in "${flags[@]}"; do
+            if [[ "$f" == "--all-namespaces" ]] || [[ "$f" == "-A" ]]; then
+                continue
+            fi
+            per_flags+=("$f")
+        done
+
+        declare -A ns_groups
+        for rn in "${resource_names[@]}"; do
+            local ns_part="${rn%%/*}" name_part="${rn#*/}"
+            if [[ -z "${ns_groups[$ns_part]:-}" ]]; then ns_groups[$ns_part]="$name_part"; else ns_groups[$ns_part]="${ns_groups[$ns_part]} $name_part"; fi
+        done
+
+        for ns in "${!ns_groups[@]}"; do
+            local names_str="${ns_groups[$ns]}"
+            # Build array command
+            local cmd_arr=(kubectl get "$RESOURCE" -n "$ns")
+            read -r -a names_arr <<< "$names_str"
+            if [[ ${#names_arr[@]} -gt 0 ]]; then cmd_arr+=("${names_arr[@]}"); fi
+            if [[ ${#per_flags[@]} -gt 0 ]]; then cmd_arr+=("${per_flags[@]}"); fi
+            # Printable string for humans
+            local cmd_str
+            cmd_str=$(join_command_string "${cmd_arr[@]}")
+            # Serialized version for safe array execution (unit separator)
+            local sep=$'\x1f' serialized="" idx=0
+            for e in "${cmd_arr[@]}"; do
+                if [[ $idx -eq 0 ]]; then serialized+="$e"; else serialized+="$sep$e"; fi
+                idx=$((idx+1))
+            done
+            out_lines+=("$cmd_str"$'\t'"$serialized")
+        done
+    else
+        # Single command with resource type and names
+        local cmd_arr=(kubectl get "$RESOURCE")
+        if [[ ${#flags[@]} -gt 0 ]]; then cmd_arr+=("${flags[@]}"); fi
+        if [[ ${#resource_names[@]} -gt 0 ]]; then cmd_arr+=("${resource_names[@]}"); fi
+        local cmd_str
+        cmd_str=$(join_command_string "${cmd_arr[@]}")
+        local sep=$'\x1f' serialized="" idx=0
+        for e in "${cmd_arr[@]}"; do
+            if [[ $idx -eq 0 ]]; then serialized+="$e"; else serialized+="$sep$e"; fi
+            idx=$((idx+1))
+        done
+    out_lines+=("$cmd_str"$'\t'"$serialized")
+    fi
+
+    # Print each line as separate command; consumer will decide to execute or print-only
+    printf "%s\n" "${out_lines[@]}"
+}
+
+# Check if --no-headers flag is present
+has_no_headers() { [[ " ${KUBECTL_FLAGS[*]} " =~ " --no-headers " ]]; }
+
+# Main search function
+search_resources() {
+    local kubectl_cmd grep_pattern
+    kubectl_cmd=$(get_kubectl_cmd "$RESOURCE")
+    grep_pattern=$(build_grep_pattern)
+    read -r -a kubectl_cmd_arr <<< "$kubectl_cmd"
+    if has_no_headers; then
+        "${kubectl_cmd_arr[@]}" | grep -E "$grep_pattern" || exit 1
+    else
+        local output header matches
+        output=$("${kubectl_cmd_arr[@]}")
+        header=$(echo "$output" | head -n 1)
+        matches=$(echo "$output" | tail -n +2 | grep -E "$grep_pattern" || true)
+        if [[ -n "$matches" ]]; then echo "$header"; echo "$matches"; else exit 1; fi
+    fi
+}
+
+# Simple interactive mode - just show all resources with fzf
+simple_interactive_mode() {
+    local kubectl_cmd data selection reload_cmd header body
+    kubectl_cmd=$([[ -n "$OUTPUT_FORMAT" ]] && get_kubectl_list_cmd "$RESOURCE" || get_kubectl_cmd "$RESOURCE")
+    if ! has_fzf; then read -r -a kubectl_cmd_arr <<< "$kubectl_cmd"; "${kubectl_cmd_arr[@]}"; return; fi
+    read -r -a kubectl_cmd_arr <<< "$kubectl_cmd"; data=$("${kubectl_cmd_arr[@]}")
+    if has_no_headers; then
+        reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
+        selection=$(echo "$data" | fzf --ansi --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd)" --prompt="$RESOURCE> " --height=80%)
+    else
+        header=$(echo "$data" | head -n 1); body=$(echo "$data" | tail -n +2)
+        reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
+        selection=$(echo "$body" | fzf --ansi --header="$header" --header-lines=0 --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd | tail -n +2)" --prompt="$RESOURCE> " --height=80%)
+    fi
+    if [[ -n "$OUTPUT_FORMAT" ]] && [[ -n "$selection" ]]; then
+        local cmd_lines
+        mapfile -t cmd_lines < <(build_kubectl_command_for_selection "$selection")
+        for cl in "${cmd_lines[@]}"; do
+            local printable serialized sep=$'\x1f'
+            IFS=$'\t' read -r printable serialized <<< "$cl"
+            echo -e "${BLUE}Executing: $printable${NC}" >&2
+            IFS="$sep" read -r -a exec_arr <<< "$serialized"; "${exec_arr[@]}"
+        done
+    else
+        echo "$selection"
+    fi
+}
+
+# Enhanced fzf search mode
+fzf_search_mode() {
+    local kubectl_cmd initial_query data selection reload_cmd header body
+    kubectl_cmd=$([[ -n "$OUTPUT_FORMAT" ]] && get_kubectl_list_cmd "$RESOURCE" || get_kubectl_cmd "$RESOURCE")
+    if ! has_fzf; then search_resources; return; fi
+    initial_query="${PATTERNS[0]:-}"
+    read -r -a kubectl_cmd_arr <<< "$kubectl_cmd"; data=$("${kubectl_cmd_arr[@]}")
+    if has_no_headers; then
+        reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
+        selection=$(echo "$data" | fzf --ansi --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd)" --query="$initial_query" --prompt="$RESOURCE> " --height=80%)
+    else
+        header=$(echo "$data" | head -n 1); body=$(echo "$data" | tail -n +2)
+        reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
+        selection=$(echo "$body" | fzf --ansi --header="$header" --header-lines=0 --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd | tail -n +2)" --query="$initial_query" --prompt="$RESOURCE> " --height=80%)
+    fi
+    if [[ -n "$OUTPUT_FORMAT" ]] && [[ -n "$selection" ]]; then
+        local cmd_lines
+        mapfile -t cmd_lines < <(build_kubectl_command_for_selection "$selection")
+        for cl in "${cmd_lines[@]}"; do
+            local printable serialized sep=$'\x1f'
+            IFS=$'\t' read -r printable serialized <<< "$cl"
+            echo -e "${BLUE}Executing: $printable${NC}" >&2
+            IFS="$sep" read -r -a exec_arr <<< "$serialized"; "${exec_arr[@]}"
+        done
+    else
+        echo "$selection"
+    fi
+}
+
+# Main execution
+main() {
+    parse_args "$@"
+    
+    # Validate kubectl is available
+    if ! command -v kubectl >/dev/null 2>&1; then
+        echo -e "${RED}Error: kubectl not found in PATH${NC}" >&2
+        exit 1
+    fi
+    
+    if [[ "$INTERACTIVE" == true ]]; then
+        if [[ ${#PATTERNS[@]} -gt 0 ]]; then
+            fzf_search_mode
+        else
+            simple_interactive_mode
+        fi
+    else
+        search_resources
+    fi
+}
+
+# Run main function with all arguments
+main "$@"

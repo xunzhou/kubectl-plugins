@@ -30,3 +30,8 @@ kubectl recreate -f <file>
 cordonx:
 - kubectl cordonx <node1> [node2 ...]
 - kubectl cordonx --undo
+
+find:
+- kubectl find <resource> <pattern1> [pattern2] [...]
+- kubectl find po -i
+- kubectl find po -s
