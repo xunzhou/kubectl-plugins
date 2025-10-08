@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Check if search term is provided
+if [ -z "$1" ]; then
+  echo "Usage: kubectl vatt <search-term>" >&2
+  exit 1
+fi
+
+SEARCH_TERM="$1"
+
+# Get PVCs matching the search term
+PVC_OUTPUT=$(kubectl get pvc --no-headers 2>/dev/null | grep "$SEARCH_TERM" || true)
+
+# Check if any results were found
+if [ -z "$PVC_OUTPUT" ]; then
+  exit 1
+fi
+
+# Count number of matches
+LINE_COUNT=$(echo "$PVC_OUTPUT" | wc -l)
+
+# If only one match, use it directly; otherwise use fzf
+if [ "$LINE_COUNT" -eq 1 ]; then
+  SELECTED_PVC="$PVC_OUTPUT"
+else
+  # Check if fzf is installed
+  if ! command -v fzf &>/dev/null; then
+    echo "Error: Multiple PVCs found but fzf is not installed" >&2
+    exit 1
+  fi
+
+  # Use fzf to select a PVC (fzf outputs to stderr, so selection happens interactively)
+  SELECTED_PVC=$(echo "$PVC_OUTPUT" | fzf --height=40% --header="Select a PVC:")
+
+  # Check if user cancelled fzf
+  if [ -z "$SELECTED_PVC" ]; then
+    exit 1
+  fi
+fi
+
+# Extract PV name (volume) from the selected PVC - it's typically the 3rd column
+PV_NAME=$(echo "$SELECTED_PVC" | awk '{print $3}')
+
+if [ -z "$PV_NAME" ] || [ "$PV_NAME" = "<none>" ]; then
+  exit 1
+fi
+
+# Get VolumeAttachments matching the PV name
+kubectl get volumeattachments.storage.k8s.io --no-headers 2>/dev/null | grep "$PV_NAME" || true

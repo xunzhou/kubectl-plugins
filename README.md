@@ -35,3 +35,7 @@ find:
 - kubectl find <resource> <pattern1> [pattern2] [...]
 - kubectl find po -i
 - kubectl find po -s
+
+vatt: 
+- pvc to volumeattachment
+- kubectl vatt <pvc_name_pattern>
