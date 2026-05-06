@@ -39,3 +39,14 @@ find:
 vatt: 
 - pvc to volumeattachment
 - kubectl vatt <pvc_name_pattern>
+
+grep:
+- `kubectl get <resource> | grep <query>` shortcut; query matches any column
+- kubectl grep <resource>[/<query>] [query]
+- kubectl grep pod 7d                  (any column: NAME, STATUS, AGE, ...)
+- kubectl grep 'pod*' nginx            (multi-resource via resource glob, parallel)
+- kubectl grep '*/nginx'               (any resource, row contains 'nginx')
+- -c / --compact: `<ns>\t<r>/<name>` per line (awk/xargs friendly)
+- -nr / --not-ready: drop healthy rows (Completed|Succeeded|X/X)
+- -E / --regex: treat query as raw regex (anchors, quantifiers)
+- unknown flags pass through to kubectl get (-owide, --show-labels, ...)

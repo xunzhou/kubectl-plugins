@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+usage() {
+  cat <<'EOF'
+Usage: kubectl pod-kill [-n NAMESPACE | -A] [initial-query]
+
+Interactively filter and bulk-delete pods using fzf.
+
+Options:
+  -n NAMESPACE   Target a specific namespace
+  -A             All namespaces (default)
+  -h, --help     Show this help
+
+fzf controls:
+  TAB / shift-TAB  Toggle select / deselect pod
+  ctrl-a           Select all visible
+  D                Delete all selected pods (y/F/N prompt: F = force)
+  ctrl-r           Refresh pod list from cluster
+  Esc / ctrl-c     Cancel
+
+Query syntax:
+  term1 term2                 include: spaces = AND (chained greps)
+  term1|term2                 include: pipe = OR (within one term)
+  include // excl1 excl2      include terms // space-separated excludes (AND)
+
+Examples:
+  kubectl pod-kill
+  kubectl pod-kill nginx
+  kubectl pod-kill -n production
+  [in fzf] nginx 79.23                        (nginx AND on node *79.23*)
+  [in fzf] 10.0.1.1|10.0.2.2 // kube-system logging monitoring
+EOF
+  exit 1
+}
+
+# ── dependencies ───────────────────────────────────────────────────────────────
+if ! command -v fzf &>/dev/null; then
+  echo -e "${RED}Error: fzf not found in PATH${NC}" >&2
+  exit 1
+fi
+
+# ── argument parsing ───────────────────────────────────────────────────────────
+NAMESPACE=""
+ALL_NS=true
+SEARCH_TERM=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -A)       ALL_NS=true; NAMESPACE=""; shift ;;
+    -n)       NAMESPACE="$2"; ALL_NS=false; shift 2 ;;
+    -n*)      NAMESPACE="${1#-n}"; ALL_NS=false; shift ;;
+    -h|--help) usage ;;
+    -*)       echo -e "${RED}Unknown flag: $1${NC}" >&2; usage ;;
+    *)
+      if [[ -z "$SEARCH_TERM" ]]; then SEARCH_TERM="$1"
+      else echo -e "${RED}Unexpected argument: $1${NC}" >&2; usage
+      fi
+      shift ;;
+  esac
+done
+
+# ── temp files ─────────────────────────────────────────────────────────────────
+POD_CACHE=$(mktemp /tmp/kpk_pods_XXXXXX)
+FILTER_SCRIPT=$(mktemp /tmp/kpk_filter_XXXXXX)
+SEL_FILE=$(mktemp /tmp/kpk_sel_XXXXXX)
+RESTORE_SCRIPT=$(mktemp /tmp/kpk_restore_XXXXXX)
+trap "rm -f '$POD_CACHE' '$FILTER_SCRIPT' '$SEL_FILE' '$RESTORE_SCRIPT'" EXIT
+
+# Filter script: reads FZF_QUERY from env, POD_CACHE path embedded at write time.
+# Query syntax: "include_regex // excl1 excl2 ..."
+cat > "$FILTER_SCRIPT" << FILTER_EOF
+#!/bin/bash
+QUERY="\${FZF_QUERY:-}"
+POD_CACHE_PATH="${POD_CACHE}"
+
+if [[ "\$QUERY" == *" // "* ]]; then
+  INCLUDE="\${QUERY%% // *}"
+  EXCLUDE_RAW="\${QUERY##* // }"
+else
+  INCLUDE="\$QUERY"
+  EXCLUDE_RAW=""
+fi
+
+result=\$(cat "\$POD_CACHE_PATH")
+# include: each space-separated token is a chained grep (AND); | within a token = OR
+for term in \$INCLUDE; do
+  [[ -z "\$term" ]] && continue
+  result=\$(echo "\$result" | grep -E -- "\$term" 2>/dev/null || true)
+done
+# exclude: each token is a grep -v (AND)
+for term in \$EXCLUDE_RAW; do
+  [[ -z "\$term" ]] && continue
+  result=\$(echo "\$result" | grep -v -F -- "\$term" || true)
+done
+printf '%s\n' "\$result" | grep .
+FILTER_EOF
+chmod +x "$FILTER_SCRIPT"
+
+# Pod name column index: 2 under -A (namespace is col 1), 1 under -n
+if [[ "$ALL_NS" == true ]]; then
+  NAME_COL=2
+else
+  NAME_COL=1
+fi
+
+# Restore script: re-selects saved pods after a reload using pos(n)+select.
+# Runs the filter script (inheriting $FZF_QUERY from fzf's env) to find each
+# saved pod's current line number, then emits pos(n)+select for each.
+cat > "$RESTORE_SCRIPT" << RESTORE_EOF
+#!/bin/bash
+SEL="${SEL_FILE}"
+FSCRIPT="${FILTER_SCRIPT}"
+NCOL="${NAME_COL}"
+
+[[ ! -s "\$SEL" ]] && exit 0
+
+# Get the same list that reload-sync just loaded (FZF_QUERY is inherited from fzf)
+mapfile -t items < <(bash "\$FSCRIPT" 2>/dev/null)
+[[ \${#items[@]} -eq 0 ]] && exit 0
+
+# Build a lookup set of saved pod names
+declare -A saved
+while IFS= read -r name; do
+  [[ -n "\$name" ]] && saved["\$name"]=1
+done < "\$SEL"
+
+# Emit pos(n)+select for each matching line (1-indexed positions)
+cmds=()
+for (( i=0; i<\${#items[@]}; i++ )); do
+  name=\$(awk -v col="\$NCOL" '{print \$col}' <<< "\${items[\$i]}")
+  if [[ -n "\${saved[\$name]+x}" ]]; then
+    cmds+=("pos(\$((i+1)))+select")
+  fi
+done
+
+[[ \${#cmds[@]} -eq 0 ]] && exit 0
+(IFS='+'; echo "\${cmds[*]}")
+RESTORE_EOF
+chmod +x "$RESTORE_SCRIPT"
+
+# ── fetch initial pod list ─────────────────────────────────────────────────────
+if [[ "$ALL_NS" == true ]]; then
+  kubectl get pods -A -owide --no-headers 2>/dev/null > "$POD_CACHE" || true
+else
+  kubectl get pods -n "$NAMESPACE" -owide --no-headers 2>/dev/null > "$POD_CACHE" || true
+fi
+
+if [[ ! -s "$POD_CACHE" ]]; then
+  echo -e "${YELLOW}No pods found.${NC}" >&2
+  exit 0
+fi
+
+# ── build refresh command (embedded in fzf bind string) ────────────────────────
+if [[ "$ALL_NS" == true ]]; then
+  REFRESH_CMD="kubectl get pods -A -owide --no-headers > '${POD_CACHE}' 2>/dev/null || true"
+else
+  NS_QUOTED=$(printf '%q' "$NAMESPACE")
+  REFRESH_CMD="kubectl get pods -n ${NS_QUOTED} -owide --no-headers > '${POD_CACHE}' 2>/dev/null || true"
+fi
+
+FZF_HEADER=$'TAB=select  ctrl-a=all  D=delete  ctrl-r=refresh  Esc=cancel\nQuery: t1 t2=AND  t1|t2=OR  //  excl1 excl2=AND-exclude'
+
+# Bind fragments for save-selection + reload-sync + restore-selection.
+# {+} expands to selected items as shell-escaped args; awk extracts the pod name column.
+# reload-sync (not reload) ensures list is updated before transform re-selects.
+SAVE_SEL="execute-silent(printf '%s\n' {+} | awk '{print \$$NAME_COL}' > '${SEL_FILE}')"
+RELOAD_FILTER="reload-sync(bash '${FILTER_SCRIPT}')"
+RESTORE_SEL="transform(bash '${RESTORE_SCRIPT}')"
+
+# ── fzf selection ──────────────────────────────────────────────────────────────
+OUTPUT=$(cat "$POD_CACHE" | fzf \
+  --multi \
+  --disabled \
+  --ansi \
+  --expect=D \
+  --bind "ctrl-a:select-all" \
+  --bind "start:reload(bash '${FILTER_SCRIPT}')" \
+  --bind "change:${SAVE_SEL}+${RELOAD_FILTER}+${RESTORE_SEL}" \
+  --bind "ctrl-r:execute-silent(${REFRESH_CMD})+${SAVE_SEL}+${RELOAD_FILTER}+${RESTORE_SEL}" \
+  --header "$FZF_HEADER" \
+  --prompt "pod-kill> " \
+  -q "$SEARCH_TERM" \
+  || true)
+
+# ── parse fzf output ───────────────────────────────────────────────────────────
+# --expect=D: line 1 = trigger key ("D" or "" for Enter), rest = selected pods
+if [[ -z "$OUTPUT" ]]; then
+  echo -e "${YELLOW}Cancelled.${NC}" >&2
+  exit 0
+fi
+
+KEY=$(printf '%s\n' "$OUTPUT" | head -1)
+SELECTED=$(printf '%s\n' "$OUTPUT" | tail -n +2)
+
+if [[ "$KEY" != "D" ]]; then
+  exit 0
+fi
+
+if [[ -z "$SELECTED" ]]; then
+  echo -e "${YELLOW}No pods selected.${NC}" >&2
+  exit 0
+fi
+
+# ── confirm deletion ───────────────────────────────────────────────────────────
+POD_COUNT=$(echo "$SELECTED" | grep -c .)
+echo -e "${BLUE}Pods selected for deletion:${NC}"
+echo "$SELECTED" | while IFS= read -r line; do echo "  $line"; done
+echo ""
+
+read -r -p "$(echo -e "${RED}Delete ${POD_COUNT} pod(s)? [y/F/N]${NC}  (F = --force --grace-period 0): ")" confirm < /dev/tty
+case "$confirm" in
+  [yY]) FORCE_FLAGS="" ;;
+  [fF]) FORCE_FLAGS="--force --grace-period 0" ;;
+  *)    echo -e "${YELLOW}Aborted.${NC}"; exit 0 ;;
+esac
+
+# ── delete ─────────────────────────────────────────────────────────────────────
+echo ""
+DELETED=0
+FAILED=0
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+
+  if [[ "$ALL_NS" == true ]]; then
+    POD_NS=$(awk '{print $1}' <<< "$line")
+    POD_NAME=$(awk '{print $2}' <<< "$line")
+  else
+    POD_NS="$NAMESPACE"
+    POD_NAME=$(awk '{print $1}' <<< "$line")
+  fi
+
+  printf "${BLUE}Deleting${NC} %s/%s ... " "$POD_NS" "$POD_NAME"
+  # shellcheck disable=SC2086
+  if kubectl delete pod -n "$POD_NS" "$POD_NAME" --wait=false $FORCE_FLAGS 2>/dev/null; then
+    echo -e "${GREEN}done${NC}"
+    DELETED=$((DELETED + 1))
+  else
+    echo -e "${RED}FAILED${NC}"
+    FAILED=$((FAILED + 1))
+  fi
+done <<< "$SELECTED"
+
+echo ""
+echo -e "Summary: ${GREEN}${DELETED} deleted${NC}  ${RED}${FAILED} failed${NC}"

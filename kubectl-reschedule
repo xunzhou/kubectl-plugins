@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: kubectl reschedule <pod> [pod2 ...] [-n NAMESPACE]
+
+Cordon the node each pod is on, delete the pod, then uncordon the node.
+If a node was already cordoned before this operation, it is left cordoned.
+
+Options:
+  -n NAMESPACE   Namespace (defaults to current context namespace)
+  -h, --help     Show this help
+EOF
+  exit 1
+}
+
+PODS=()
+NAMESPACE_FLAG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n)       NAMESPACE_FLAG="-n $2"; shift 2 ;;
+    -n*)      NAMESPACE_FLAG="-n ${1#-n}"; shift ;;
+    -h|--help) usage ;;
+    -*)       echo "Unknown flag: $1" >&2; usage ;;
+    *)        PODS+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#PODS[@]} -eq 0 ]]; then
+  usage
+fi
+
+# Phase 1: resolve nodes and record pre-existing cordon state, then cordon all
+declare -A already_cordoned
+declare -A pod_node
+
+for POD in "${PODS[@]}"; do
+  NODE=$(kubectl get pod $NAMESPACE_FLAG "$POD" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+  if [[ -z "$NODE" ]]; then
+    echo "Error: could not determine node for pod '$POD'" >&2
+    continue
+  fi
+  pod_node[$POD]=$NODE
+
+  if [[ -z "${already_cordoned[$NODE]+x}" ]]; then
+    NODE_STATUS=$(kubectl get node "$NODE" --no-headers | awk '{print $2}')
+    if [[ "$NODE_STATUS" == *"SchedulingDisabled"* ]]; then
+      already_cordoned[$NODE]=true
+      echo "Node $NODE is already cordoned — will not uncordon after delete"
+    else
+      already_cordoned[$NODE]=false
+    fi
+    kubectl cordon "$NODE"
+  fi
+done
+
+# Phase 2: delete all pods
+for POD in "${PODS[@]}"; do
+  [[ -z "${pod_node[$POD]+x}" ]] && continue
+  kubectl delete pod $NAMESPACE_FLAG "$POD"
+done
+
+# Phase 3: restore cordon state
+for NODE in "${!already_cordoned[@]}"; do
+  if [[ "${already_cordoned[$NODE]}" == false ]]; then
+    kubectl uncordon "$NODE"
+  fi
+done

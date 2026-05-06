@@ -400,11 +400,18 @@ simple_interactive_mode() {
     read -r -a kubectl_cmd_arr <<< "$kubectl_cmd"; data=$("${kubectl_cmd_arr[@]}")
     if has_no_headers; then
         reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
-        selection=$(echo "$data" | fzf --ansi --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd)" --prompt="$RESOURCE> " --height=80%)
+        # Preview: show `kubectl describe` for the highlighted line. If items are in NAMESPACE/NAME form
+        # we run `kubectl describe <resource> -n <ns> <name>`, otherwise `kubectl describe <resource> <name>`.
+        preview_cmd='awk "{print \$0}" | awk -v res="'"$RESOURCE"'" '\\
+            '{ if ($0 == "") exit; name=$1; if (name ~ "/") {split(name, a, "/"); ns=a[1]; nm=a[2]; cmd=sprintf("kubectl describe %s %s -n %s", res, nm, ns);} else {cmd=sprintf("kubectl describe %s %s", res, name);} print "----\n"; system(cmd) }'
+        selection=$(echo "$data" | fzf --ansi --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd)" --preview="$preview_cmd" --preview-window=right:60% --prompt="$RESOURCE> " --height=80%)
     else
         header=$(echo "$data" | head -n 1); body=$(echo "$data" | tail -n +2)
         reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
-        selection=$(echo "$body" | fzf --ansi --header="$header" --header-lines=0 --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd | tail -n +2)" --prompt="$RESOURCE> " --height=80%)
+        # For header/body mode we need to preview using the line content. Use awk to extract first column.
+        preview_cmd='awk "{print \$0}" | awk -v res="'"$RESOURCE"'" '\\
+            '{ if ($0 == "") exit; name=$1; if (name ~ "/") {split(name, a, "/"); ns=a[1]; nm=a[2]; cmd=sprintf("kubectl describe %s %s -n %s", res, nm, ns);} else {cmd=sprintf("kubectl describe %s %s", res, name);} print "----\n"; system(cmd) }'
+        selection=$(echo "$body" | fzf --ansi --header="$header" --header-lines=0 --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd | tail -n +2)" --preview="$preview_cmd" --preview-window=right:60% --prompt="$RESOURCE> " --height=80%)
     fi
     if [[ -n "$OUTPUT_FORMAT" ]] && [[ -n "$selection" ]]; then
         local cmd_lines
@@ -429,11 +436,15 @@ fzf_search_mode() {
     read -r -a kubectl_cmd_arr <<< "$kubectl_cmd"; data=$("${kubectl_cmd_arr[@]}")
     if has_no_headers; then
         reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
-        selection=$(echo "$data" | fzf --ansi --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd)" --query="$initial_query" --prompt="$RESOURCE> " --height=80%)
+        preview_cmd='awk "{print \$0}" | awk -v res="'"$RESOURCE"'" '\\
+            '{ if ($0 == "") exit; name=$1; if (name ~ "/") {split(name, a, "/"); ns=a[1]; nm=a[2]; cmd=sprintf("kubectl describe %s %s -n %s", res, nm, ns);} else {cmd=sprintf("kubectl describe %s %s", res, name);} print "----\n"; system(cmd) }'
+        selection=$(echo "$data" | fzf --ansi --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd)" --query="$initial_query" --preview="$preview_cmd" --preview-window=right:60% --prompt="$RESOURCE> " --height=80%)
     else
         header=$(echo "$data" | head -n 1); body=$(echo "$data" | tail -n +2)
         reload_cmd=$(get_kubectl_list_cmd_string "$RESOURCE")
-        selection=$(echo "$body" | fzf --ansi --header="$header" --header-lines=0 --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd | tail -n +2)" --query="$initial_query" --prompt="$RESOURCE> " --height=80%)
+        preview_cmd='awk "{print \$0}" | awk -v res="'"$RESOURCE"'" '\\
+            '{ if ($0 == "") exit; name=$1; if (name ~ "/") {split(name, a, "/"); ns=a[1]; nm=a[2]; cmd=sprintf("kubectl describe %s %s -n %s", res, nm, ns);} else {cmd=sprintf("kubectl describe %s %s", res, name);} print "----\n"; system(cmd) }'
+        selection=$(echo "$body" | fzf --ansi --header="$header" --header-lines=0 --multi --bind="ctrl-a:select-all" --bind="ctrl-d:deselect-all" --bind="ctrl-s:toggle" --bind="ctrl-r:reload($reload_cmd | tail -n +2)" --query="$initial_query" --preview="$preview_cmd" --preview-window=right:60% --prompt="$RESOURCE> " --height=80%)
     fi
     if [[ -n "$OUTPUT_FORMAT" ]] && [[ -n "$selection" ]]; then
         local cmd_lines

@@ -2,9 +2,18 @@
 
 set -e
 
+# Parse flags
+DELETE=false
+while [[ "$1" == -* ]]; do
+  case "$1" in
+    -rm) DELETE=true; shift ;;
+    *) echo "Unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
 # Check if search term is provided
 if [ -z "$1" ]; then
-  echo "Usage: kubectl vatt <search-term>" >&2
+  echo "Usage: kubectl vatt [-rm] <search-term>" >&2
   exit 1
 fi
 
@@ -48,4 +57,21 @@ if [ -z "$PV_NAME" ] || [ "$PV_NAME" = "<none>" ]; then
 fi
 
 # Get VolumeAttachments matching the PV name
-kubectl get volumeattachments.storage.k8s.io --no-headers 2>/dev/null | grep "$PV_NAME" || true
+VA_OUTPUT=$(kubectl get volumeattachments.storage.k8s.io --no-headers 2>/dev/null | grep "$PV_NAME" || true)
+
+if [ -z "$VA_OUTPUT" ]; then
+  exit 1
+fi
+
+echo "$VA_OUTPUT"
+
+if [ "$DELETE" = true ]; then
+  read -r -p "Delete these volumeattachments? [y/N] " confirm
+  if [[ "$confirm" =~ ^[yY]$ ]]; then
+    VA_NAMES=$(echo "$VA_OUTPUT" | awk '{print $1}')
+    for VA in $VA_NAMES; do
+      echo "Deleting volumeattachment: $VA"
+      kubectl delete volumeattachments.storage.k8s.io "$VA"
+    done
+  fi
+fi

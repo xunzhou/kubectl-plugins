@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Force a pod to reschedule onto a specific node by temporarily cordoning all
+# other nodes, restarting the pod, waiting for it to be Ready, then restoring
+# the original cordon state.
+
+TIMEOUT=300
+PARALLEL=10
+ROLLOUT=0
+NAMESPACE=""
+POD_PATTERN=""
+TARGET_NODE=""
+
+usage() {
+  cat >&2 <<EOF
+Usage: kubectl force-node [-n <namespace>] [--rollout] [--timeout <sec>] [--parallel <n>] <pod-pattern> <target-node>
+
+Options:
+  -n, --namespace   Namespace to search (default: all namespaces)
+  --rollout         Use 'kubectl rollout restart' instead of pod deletion
+  --timeout         Seconds to wait for replacement pod to be Ready (default: 300)
+  --parallel        Max concurrent kubectl cordon/uncordon calls (default: 10)
+  -h, --help        Show this help
+EOF
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--namespace) NAMESPACE="$2"; shift 2 ;;
+    --rollout)      ROLLOUT=1; shift ;;
+    --timeout)      TIMEOUT="$2"; shift 2 ;;
+    --parallel)     PARALLEL="$2"; shift 2 ;;
+    -h|--help)      usage ;;
+    -*)             echo "Unknown flag: $1" >&2; usage ;;
+    *)
+      if [[ -z "$POD_PATTERN" ]]; then
+        POD_PATTERN="$1"
+      elif [[ -z "$TARGET_NODE" ]]; then
+        TARGET_NODE="$1"
+      else
+        echo "Unexpected argument: $1" >&2; usage
+      fi
+      shift ;;
+  esac
+done
+
+[[ -z "$POD_PATTERN" || -z "$TARGET_NODE" ]] && usage
+
+# ── pod selection ────────────────────────────────────────────────────────────
+if [[ -n "$NAMESPACE" ]]; then
+  POD_LIST=$(kubectl get po -n "$NAMESPACE" --no-headers 2>/dev/null \
+    | grep "$POD_PATTERN" || true)
+  ALL_NS=0
+else
+  POD_LIST=$(kubectl get po -A --no-headers 2>/dev/null \
+    | grep "$POD_PATTERN" || true)
+  ALL_NS=1
+fi
+
+if [[ -z "$POD_LIST" ]]; then
+  echo "No pods matching '$POD_PATTERN' found." >&2; exit 1
+fi
+
+LINE_COUNT=$(echo "$POD_LIST" | wc -l)
+if [[ "$LINE_COUNT" -gt 1 ]]; then
+  if ! command -v fzf &>/dev/null; then
+    echo "Multiple pods found but fzf is not installed:" >&2
+    echo "$POD_LIST" >&2
+    exit 1
+  fi
+  SELECTED=$(echo "$POD_LIST" | fzf -1 --height=40% \
+    --header="Select pod to force onto $TARGET_NODE:")
+  [[ -z "$SELECTED" ]] && exit 1
+else
+  SELECTED="$POD_LIST"
+fi
+
+if [[ "$ALL_NS" -eq 1 ]]; then
+  NAMESPACE=$(echo "$SELECTED" | awk '{print $1}')
+  POD_NAME=$(echo "$SELECTED"  | awk '{print $2}')
+else
+  POD_NAME=$(echo "$SELECTED" | awk '{print $1}')
+fi
+
+echo "Pod:    $POD_NAME (namespace: $NAMESPACE)"
+echo "Target: $TARGET_NODE"
+
+# ── verify node exists ───────────────────────────────────────────────────────
+if ! kubectl get node "$TARGET_NODE" &>/dev/null; then
+  echo "Error: node '$TARGET_NODE' not found." >&2; exit 1
+fi
+
+# ── for --rollout: resolve owner before pod is deleted ──────────────────────
+if [[ "$ROLLOUT" -eq 1 ]]; then
+  OWNER_KIND=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" \
+    -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || true)
+  OWNER_NAME=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" \
+    -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null || true)
+  if [[ -z "$OWNER_KIND" ]]; then
+    echo "Error: pod '$POD_NAME' has no owner — cannot use --rollout. Remove the flag to delete the pod directly." >&2
+    exit 1
+  fi
+  if [[ "$OWNER_KIND" == "ReplicaSet" ]]; then
+    OWNER_NAME=$(kubectl get rs "$OWNER_NAME" -n "$NAMESPACE" \
+      -o jsonpath='{.metadata.ownerReferences[0].name}')
+    OWNER_KIND="Deployment"
+  fi
+  ROLLOUT_TARGET="${OWNER_KIND,,}/$OWNER_NAME"
+fi
+
+# ── capture label selector for post-restart pod matching ────────────────────
+RAW_LABELS=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" \
+  --template='{{range $k,$v := .metadata.labels}}{{$k}}={{$v}},{{end}}' 2>/dev/null || true)
+LABEL_SELECTOR=$(echo "$RAW_LABELS" \
+  | sed 's/pod-template-hash=[^,]*,\{0,1\}//g
+         s/controller-revision-hash=[^,]*,\{0,1\}//g
+         s/statefulset\.kubernetes\.io\/pod-name=[^,]*,\{0,1\}//g
+         s/,$//')
+
+if [[ -z "$LABEL_SELECTOR" ]]; then
+  echo "Warning: no stable labels found; will match replacement by name prefix." >&2
+  NAME_PREFIX="${POD_NAME%-*}"
+fi
+
+# ── save cordon state ────────────────────────────────────────────────────────
+mapfile -t PREVIOUSLY_CORDONED < <(
+  kubectl get nodes --no-headers \
+    | awk '$2=="Ready,SchedulingDisabled"{print $1}'
+)
+echo "Previously cordoned nodes (will restore): ${PREVIOUSLY_CORDONED[*]:-<none>}"
+
+# ── restore trap ─────────────────────────────────────────────────────────────
+restore_cordon_state() {
+  local ec=$?
+  echo ""
+  echo "Restoring cordon state..."
+  mapfile -t TO_UNCORDON < <(
+    kubectl get nodes --no-headers \
+      | awk '$2=="Ready,SchedulingDisabled"{print $1}'
+  )
+  if [[ ${#TO_UNCORDON[@]} -gt 0 ]]; then
+    printf '%s\n' "${TO_UNCORDON[@]}" | xargs -P "$PARALLEL" -I{} kubectl uncordon {}
+  fi
+  if [[ ${#PREVIOUSLY_CORDONED[@]} -gt 0 ]]; then
+    printf '%s\n' "${PREVIOUSLY_CORDONED[@]}" | xargs -P "$PARALLEL" -I{} kubectl cordon {}
+  fi
+  echo "Cordon state restored."
+  exit $ec
+}
+trap restore_cordon_state EXIT
+
+# ── cordon all nodes except target ───────────────────────────────────────────
+mapfile -t CORDON_NODES < <(
+  kubectl get nodes --no-headers \
+    | grep -vE "^${TARGET_NODE}[[:space:]]" \
+    | awk '{print $1}'
+)
+echo "Cordoning ${#CORDON_NODES[@]} nodes (parallel=$PARALLEL)..."
+printf '%s\n' "${CORDON_NODES[@]}" | xargs -P "$PARALLEL" -I{} kubectl cordon {}
+
+# ── restart pod ──────────────────────────────────────────────────────────────
+if [[ "$ROLLOUT" -eq 1 ]]; then
+  echo "Running: kubectl rollout restart $ROLLOUT_TARGET -n $NAMESPACE"
+  kubectl rollout restart "$ROLLOUT_TARGET" -n "$NAMESPACE"
+else
+  echo "Deleting pod '$POD_NAME'..."
+  kubectl delete pod "$POD_NAME" -n "$NAMESPACE"
+fi
+
+# ── wait for replacement pod ─────────────────────────────────────────────────
+echo "Waiting for replacement pod (timeout: ${TIMEOUT}s)..."
+START=$(date +%s)
+NEW_POD=""
+
+while true; do
+  ELAPSED=$(( $(date +%s) - START ))
+  if [[ $ELAPSED -ge $TIMEOUT ]]; then
+    echo "Timeout: replacement pod did not become Ready within ${TIMEOUT}s." >&2
+    echo "Cordon state will still be restored." >&2
+    exit 1
+  fi
+
+  if [[ -n "$LABEL_SELECTOR" ]]; then
+    CANDIDATE=$(kubectl get pods -n "$NAMESPACE" -l "$LABEL_SELECTOR" \
+      --no-headers 2>/dev/null \
+      | grep -v "^${POD_NAME}[[:space:]]" \
+      | grep "Running" \
+      | awk 'NR==1{print $1}')
+  else
+    CANDIDATE=$(kubectl get pods -n "$NAMESPACE" \
+      --no-headers 2>/dev/null \
+      | grep "^${NAME_PREFIX}" \
+      | grep -v "^${POD_NAME}[[:space:]]" \
+      | grep "Running" \
+      | awk 'NR==1{print $1}')
+  fi
+
+  if [[ -n "$CANDIDATE" ]]; then
+    READY=$(kubectl get pod "$CANDIDATE" -n "$NAMESPACE" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+    if [[ "$READY" == "True" ]]; then
+      NEW_POD="$CANDIDATE"
+      break
+    fi
+  fi
+
+  sleep 3
+done
+
+SCHEDULED_NODE=$(kubectl get pod "$NEW_POD" -n "$NAMESPACE" \
+  -o jsonpath='{.spec.nodeName}')
+echo "Pod '$NEW_POD' is Ready on node '$SCHEDULED_NODE'."
+if [[ "$SCHEDULED_NODE" != "$TARGET_NODE" ]]; then
+  echo "Warning: expected '$TARGET_NODE', got '$SCHEDULED_NODE'" >&2
+  echo "         (check nodeAffinity/nodeSelector on the pod)" >&2
+fi
+# EXIT trap fires here and restores cordon state
