@@ -9,12 +9,13 @@ NC='\033[0m'
 
 usage() {
   cat <<'EOF'
-Usage: kubectl prune <pod-name-pattern> [-n NAMESPACE | -A]
+Usage: kubectl prune <pattern> [-n NAMESPACE | -A]
        kubectl prune --all [-n NAMESPACE | -A]
 
 Force-delete pods after confirmation. Always uses --force --grace-period 0.
 
-  <pattern>   Delete pods whose NAME matches a (regex) pattern.
+  <pattern>   Delete pods whose `kubectl get po` line matches a (regex) pattern.
+              Matches against the entire line (name, status, restarts, age, etc.).
   --all       Delete all UNHEALTHY pods (READY not X/X and not Completed/Succeeded).
 
 Options:
@@ -93,7 +94,7 @@ if [[ "$ALL_UNHEALTHY" == true ]]; then
     }' || true)
   DESC="unhealthy pods"
 else
-  MATCHED=$(printf '%s\n' "$POD_LIST" | awk -v c="$NAME_COL" -v p="$PATTERN" 'NF && $c ~ p' || true)
+  MATCHED=$(printf '%s\n' "$POD_LIST" | awk -v p="$PATTERN" 'NF && $0 ~ p' || true)
   DESC="pods matching '$PATTERN'"
 fi
 
