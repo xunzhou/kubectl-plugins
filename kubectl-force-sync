@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: kubectl force-sync [-n NS] [query]
+
+Annotate an ExternalSecret with force-sync=<epoch> to trigger an immediate sync.
+Pick the ExternalSecret via fzf (fuzzy match on the optional query).
+
+Options:
+  -n NS        Namespace (default: current context namespace)
+  -h, --help   Show this help
+EOF
+  exit 1
+}
+
+NS_FLAG=()
+QUERY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n)        NS_FLAG=(-n "$2"); shift 2 ;;
+    -n*)       NS_FLAG=(-n "${1#-n}"); shift ;;
+    -h|--help) usage ;;
+    -*)        echo "Unknown flag: $1" >&2; usage ;;
+    *)         QUERY="$1"; shift ;;
+  esac
+done
+
+NAME=$(kubectl get externalsecrets.external-secrets.io "${NS_FLAG[@]}" --no-headers -o custom-columns=:.metadata.name \
+  | fzf -1 -q "$QUERY")
+
+if [[ -z "$NAME" ]]; then
+  echo "No ExternalSecret selected" >&2
+  exit 1
+fi
+
+kubectl annotate externalsecrets.external-secrets.io "${NS_FLAG[@]}" "$NAME" force-sync="$(date +%s)" --overwrite

@@ -40,6 +40,17 @@ vatt:
 - pvc to volumeattachment
 - kubectl vatt <pvc_name_pattern>
 
+prune:
+- Force-delete pods whose NAME matches a pattern, with confirmation
+- `kubectl prune <pod-name-pattern> [-n NAMESPACE | -A]`
+- `kubectl prune --all [-n NAMESPACE | -A]` — delete all UNHEALTHY pods (READY not X/X or STATUS not Running/Completed/Succeeded)
+- default: current namespace; always --force --grace-period 0
+
+force-sync:
+- Annotate an ExternalSecret with force-sync=<epoch> to trigger an immediate sync
+- `kubectl force-sync [-n NS] [query]`
+- picks the ExternalSecret via fzf (fuzzy match on the optional query)
+
 grep:
 - `kubectl get <resource> | grep <query>` shortcut; query matches any column
 - kubectl grep <resource>[/<query>] [query]
