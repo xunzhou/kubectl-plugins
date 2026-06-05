@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Cordons all nodes except those passed as arguments, or uncordons disabled nodes with --undo
+# Cordons all nodes except those passed as arguments, or uncordons with --undo.
+#
+# State: when cordonx cordons nodes it records exactly which nodes it cordoned
+# (per cluster context). --undo uncordons only those, leaving nodes that were
+# already cordoned before cordonx ran untouched. If no saved state exists,
+# --undo falls back to uncordoning every SchedulingDisabled node.
 
 undo=0
 nodes=()
+PARALLEL=10
 
 # Parse arguments
 for arg in "$@"; do
@@ -22,11 +28,28 @@ if [ $undo -eq 0 ] && [ ${#nodes[@]} -eq 0 ]; then
   exit 1
 fi
 
+# ── per-context state file ───────────────────────────────────────────────────
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/kubectl-cordonx"
+context=$(kubectl config current-context 2>/dev/null)
+[ -n "$context" ] || context="default"
+# sanitize the context into a safe filename (teleport contexts contain dots/dashes)
+state_key=$(printf '%s' "$context" | sed 's/[^A-Za-z0-9._-]/_/g')
+state_file="$state_dir/$state_key.state"
+
+# nodes currently in Ready,SchedulingDisabled
+cordoned_nodes() {
+  kubectl get nodes --no-headers | awk '$2=="Ready,SchedulingDisabled"{print $1}'
+}
+
 if [ $undo -eq 1 ]; then
-  # Uncordon nodes that are currently cordoned (SchedulingDisabled)
-  kubectl get nodes --no-headers | awk '$2=="Ready,SchedulingDisabled"{print $1}' | while read -r node; do
-    kubectl uncordon "$node"
-  done
+  if [ -s "$state_file" ]; then
+    # Uncordon only the nodes cordonx recorded for this context
+    grep -v '^$' "$state_file" | xargs -r -P "$PARALLEL" -I{} kubectl uncordon {}
+    rm -f "$state_file"
+  else
+    echo "cordonx: no saved state for context '$context'; uncordoning all SchedulingDisabled nodes" >&2
+    cordoned_nodes | xargs -r -P "$PARALLEL" -I{} kubectl uncordon {}
+  fi
 else
   # Build exclusion regex from arguments
   exclude_regex=$(
@@ -34,8 +57,25 @@ else
     echo "${nodes[*]}"
   )
 
-  # Cordons nodes not in the exclude list
-  kubectl get nodes --no-headers | grep -vE "$exclude_regex" | awk '{print $1}' | while read -r node; do
-    kubectl cordon "$node"
-  done
+  # Capture nodes that were already cordoned before this run — these must not be
+  # recorded, so --undo leaves them cordoned.
+  already_cordoned=$(cordoned_nodes)
+
+  # Nodes not in the exclude list (the full set cordonx will cordon).
+  target_nodes=$(kubectl get nodes --no-headers | grep -vE "$exclude_regex" | awk '{print $1}')
+
+  # Of those, the ones not already cordoned — these go into saved state so --undo
+  # leaves pre-existing cordons untouched.
+  newly_cordoned=$(comm -23 <(printf '%s\n' "$target_nodes" | sort -u) \
+                            <(printf '%s\n' "$already_cordoned" | sort -u))
+
+  # Fire all cordons in parallel.
+  printf '%s\n' "$target_nodes" | grep -v '^$' | xargs -r -P "$PARALLEL" -I{} kubectl cordon {}
+
+  # Merge newly-cordoned nodes into existing state (union), keyed by context.
+  mkdir -p "$state_dir"
+  {
+    [ -f "$state_file" ] && cat "$state_file"
+    printf '%s\n' "$newly_cordoned"
+  } | grep -v '^$' | sort -u >"$state_file.tmp" && mv "$state_file.tmp" "$state_file"
 fi
