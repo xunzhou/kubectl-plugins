@@ -1,0 +1,8 @@
+#!/bin/bash
+# kubectl tail [query] [extra stern args] -- fzf-pick pod(s), live-follow with stern.
+# Enter picks the highlighted pod; Tab marks extras for a multi-pod tail.
+sel=$(kubectl get po -A | fzf -m -1 -n2 -q "$1")
+[ -z "$sel" ] && exit 1
+nss=$(awk '{print $1}' <<<"$sel" | sort -u | paste -sd,)
+pods=$(awk '{print $2}' <<<"$sel" | paste -sd'|')
+exec stern -n "$nss" --tail 10 "^(${pods})\$" "${@:2}"

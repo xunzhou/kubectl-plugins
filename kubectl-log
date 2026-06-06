@@ -1,2 +1,4 @@
 #!/bin/bash
-kubectl logs $(kubectl get po -A | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}') ${@:2}
+sel=$(kubectl get po -A | fzf -1 -n2 -q "$1" | awk '{print "-n" $1, $2}')
+[ -z "$sel" ] && exit 1
+exec kubectl logs $sel "${@:2}"
