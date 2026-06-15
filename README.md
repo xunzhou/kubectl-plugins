@@ -46,6 +46,14 @@ prune:
 - `kubectl prune --all [-n NAMESPACE | -A]` — delete all UNHEALTHY pods (READY not X/X or STATUS not Running/Completed/Succeeded)
 - default: current namespace; always --force --grace-period 0
 
+fdrain:
+- Drain node(s), force-deleting pods the eviction API can't move because a PodDisruptionBudget would be violated (drain --force does NOT bypass PDBs)
+- Only acts on ALREADY-CORDONED (SchedulingDisabled) nodes — cordon first; uncordoned matches are skipped. Prompts once for the destructive op
+- `kubectl fdrain <node> [node ...]` — runs `kubectl drain --delete-emptydir-data --ignore-daemonsets` (defaults) per node in parallel, then force-deletes (--force --grace-period 0) any pod still pinned by a zero-allowance PDB
+- `kubectl fdrain -l <selector>` — target every cordoned node matching a label selector (e.g. `-l node.info/kubeletVersion=v1.28`)
+- `kubectl fdrain -y ...` — skip the destructive-op and per-pod confirmations
+- unrecognized flags (e.g. `--force`) pass through to `kubectl drain`; options: --poll, --grace (let eviction run first), --timeout
+
 force-sync:
 - Annotate an ExternalSecret with force-sync=<epoch> to trigger an immediate sync
 - `kubectl force-sync [-n NS] [query]`
