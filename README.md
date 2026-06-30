@@ -24,6 +24,15 @@ diff-rs:
 - kubectl diff-rs <replicaset>
 - kubectl diff-rs <replicaset> LAST LAST-3
 
+rs:
+- A Deployment's whole rollout history: ReplicaSets oldest->newest, then a diff of every CONSECUTIVE revision (each block = what that rollout changed). diff-rs compares TWO; this walks all retained revisions.
+- `kubectl rs <deployment> [-n NS | -A]`  (single token — `kubectl-rs`; kubectl reads each dash as a word boundary, so a `kubectl-rs-timeline` name would dispatch as `kubectl rs timeline`)
+- filters by ownerReferences (correct lineage, no cross-deployment interleaving); sanitizes via `kubectl neat` (--no-neat for jq scrub, --raw for full yaml)
+- diffs render with `dyff` (semantic, path-addressed) when installed, else colorized `diff -u`; force the latter with `--plain`
+- auto-pages on a TTY via `$PAGER` (else `less -RF`, else `bat`); piped/redirected output is never paged; `-P`/`--no-pager` to disable
+- `--no-diff`: timeline table only
+- unknown flags / anything after `--` pass through to `kubectl get rs` (--context, --kubeconfig, -l ...)
+
 recreate:  
 kubectl recreate -f <file>
 

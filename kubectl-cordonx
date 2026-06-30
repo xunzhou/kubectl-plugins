@@ -4,9 +4,11 @@
 # State: when cordonx cordons nodes it records exactly which nodes it cordoned
 # (per cluster context). --undo uncordons only those, leaving nodes that were
 # already cordoned before cordonx ran untouched. If no saved state exists,
-# --undo falls back to uncordoning every SchedulingDisabled node.
+# --undo does nothing (so it never clobbers maintenance cordons it didn't set);
+# pass --undo --all to force-uncordon every SchedulingDisabled node.
 
 undo=0
+all=0
 nodes=()
 PARALLEL=10
 
@@ -16,6 +18,9 @@ for arg in "$@"; do
   -u | --undo)
     undo=1
     ;;
+  -a | --all)
+    all=1
+    ;;
   *)
     nodes+=("$arg")
     ;;
@@ -24,7 +29,8 @@ done
 
 if [ $undo -eq 0 ] && [ ${#nodes[@]} -eq 0 ]; then
   echo "Usage: kubectl cordonx <node1> [node2 ...]"
-  echo "       kubectl cordonx --undo"
+  echo "       kubectl cordonx --undo          # uncordon only nodes cordonx recorded"
+  echo "       kubectl cordonx --undo --all    # uncordon every SchedulingDisabled node"
   exit 1
 fi
 
@@ -42,13 +48,22 @@ cordoned_nodes() {
 }
 
 if [ $undo -eq 1 ]; then
-  if [ -s "$state_file" ]; then
+  if [ $all -eq 1 ]; then
+    # Explicit opt-in: uncordon every SchedulingDisabled node, recorded or not.
+    echo "cordonx: --all given; uncordoning every SchedulingDisabled node" >&2
+    cordoned_nodes | xargs -r -P "$PARALLEL" -I{} kubectl uncordon {}
+    rm -f "$state_file"
+  elif [ -s "$state_file" ]; then
     # Uncordon only the nodes cordonx recorded for this context
     grep -v '^$' "$state_file" | xargs -r -P "$PARALLEL" -I{} kubectl uncordon {}
     rm -f "$state_file"
   else
-    echo "cordonx: no saved state for context '$context'; uncordoning all SchedulingDisabled nodes" >&2
-    cordoned_nodes | xargs -r -P "$PARALLEL" -I{} kubectl uncordon {}
+    # No saved state: do NOT touch pre-existing cordons. cordonx only ever
+    # uncordons nodes it recorded, so with nothing recorded there is nothing
+    # to undo. (Blindly uncordoning every SchedulingDisabled node here would
+    # clobber maintenance cordons cordonx never set.)
+    echo "cordonx: no saved state for context '$context'; nothing to undo" >&2
+    echo "         (to force-uncordon every SchedulingDisabled node, run --undo --all)" >&2
   fi
 else
   # Build exclusion regex from arguments
@@ -57,25 +72,20 @@ else
     echo "${nodes[*]}"
   )
 
-  # Capture nodes that were already cordoned before this run — these must not be
-  # recorded, so --undo leaves them cordoned.
-  already_cordoned=$(cordoned_nodes)
-
   # Nodes not in the exclude list (the full set cordonx will cordon).
   target_nodes=$(kubectl get nodes --no-headers | grep -vE "$exclude_regex" | awk '{print $1}')
-
-  # Of those, the ones not already cordoned — these go into saved state so --undo
-  # leaves pre-existing cordons untouched.
-  newly_cordoned=$(comm -23 <(printf '%s\n' "$target_nodes" | sort -u) \
-                            <(printf '%s\n' "$already_cordoned" | sort -u))
 
   # Fire all cordons in parallel.
   printf '%s\n' "$target_nodes" | grep -v '^$' | xargs -r -P "$PARALLEL" -I{} kubectl cordon {}
 
-  # Merge newly-cordoned nodes into existing state (union), keyed by context.
+  # Record every node this run cordoned (the full target set), merged into any
+  # existing state for this context (union). Recording the whole target set —
+  # rather than only nodes that weren't already cordoned — keeps state reliable
+  # across re-runs: --undo always restores everything cordonx scheduled-disabled,
+  # never leaving stragglers cordoned because an earlier run had already set them.
   mkdir -p "$state_dir"
   {
     [ -f "$state_file" ] && cat "$state_file"
-    printf '%s\n' "$newly_cordoned"
+    printf '%s\n' "$target_nodes"
   } | grep -v '^$' | sort -u >"$state_file.tmp" && mv "$state_file.tmp" "$state_file"
 fi
